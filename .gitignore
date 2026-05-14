@@ -1,6 +1,9 @@
 # Large pipeline outputs (stored on HuggingFace: hf.co/ciscoriordan/dilemma)
 data/ag_lookup.json
+data/ag_lookup_scored.json
+data/ag_lsj_verb_pairs.json
 data/ag_pairs.json
+data/ag_verb_paradigms.json
 data/corpus_freq.json
 data/diorisis_freq.json
 data/diorisis_pairs.json
@@ -26,6 +29,14 @@ data/wtp.db-shm
 data/wtp.db-wal
 data/wtp.db.pickle
 data/raw_lookups.db
+
+# Third-party treebanks (independently versioned upstream; polylas_gold*.conllu
+# in data/treebanks/ stay tracked since they're original work).
+data/treebanks/Gorman/
+data/treebanks/Greek-Dependency-Trees/
+data/treebanks/UD_Ancient_Greek-Perseus/
+data/treebanks/UD_Ancient_Greek-PROIEL/
+data/treebanks/UD_Greek-GDT/
 
 # Kaikki dumps
 kaikki/

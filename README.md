@@ -6,81 +6,161 @@
 
 Dilemma is a diachronic Greek lemmatizer spanning Ancient Greek (Classical,
 Homeric, Hellenistic), Medieval/Byzantine Greek (both vernacular and
-literary), and Modern Greek (Demotic and Katharevousa). It combines multiple strategies into a unified pipeline:
+literary), and Modern Greek (Demotic and Katharevousa).
 
-- A 12.5M-form lookup table built from Wiktionary inflection tables,
-  Wiktionary's Lua morphological modules applied to LSJ and Sophocles
-  lexicon headwords, gold-standard treebanks (Perseus, PROIEL, Gorman,
-  DiGreC), and annotated corpora (GLAUx, Diorisis, HNC)
-- Dialect normalization for Ionic, Doric, Aeolic, and Koine orthographic
-  variants, mapping dialectal forms to their Attic equivalents for lookup
-- Surgical rule-based morphological analysis including augment stripping,
-  reduplication removal, particle suffix resolution, elision expansion,
-  and crasis decomposition - these handle systematic transformations that
-  the lookup table cannot enumerate exhaustively (every word x every
-  enclitic particle) and that a transformer might not generalize to for
-  rare forms it has never trained on
-- A small supervised character-level transformer (~4M parameters) trained
-  on 3.5M explicit form-lemma pairs, used only for the ~5% of words not
-  resolved by lookup or rules
-- Convention remapping to match output lemmas to target dictionaries (LSJ,
-  Cunliffe, Triantafyllidis, Wiktionary)
+Three things to know about it up front.
 
-Most Greek words resolve instantly via the lookup table. For unseen forms,
-Dilemma falls back through rule-based morphological analysis and dialect
-normalization before reaching the transformer, which learns morphological
-patterns at the character level, the standard architecture from
-[SIGMORPHON](https://sigmorphon.github.io/) shared tasks. At 4M parameters
-it trains from scratch in minutes, compared to fine-tuning approaches
-like *ByT5-small* (300M params) which take hours to train. Greek
-lemmatization is highly pattern-based - a small specialized model matches
-a large general-purpose one, and the 12.5M lookup table handles the rest.
+### A supervised character-level transformer
 
-### What's new here
+The model is a 4M-parameter encoder-decoder, the architecture from the
+[SIGMORPHON](https://sigmorphon.github.io/) shared tasks, applied to
+Greek lemmatization rather than inflection. It reads a word one Greek
+character at a time and emits the lemma one character at a time.
+Training data is 3.5M `(form, lemma)` pairs from Wiktionary inflection
+tables, the LSJ and Sophocles Lua expansions described below, and
+gold-standard treebanks (Perseus, PROIEL, Gorman, DiGreC) plus annotated
+corpora (GLAUx, Diorisis, HNC). Every pair is labelled, so the model
+learns from explicit supervision, not from raw text.
 
-Most individual components of Dilemma are established techniques. What's
-novel is the combination and the scale:
+Training from scratch on a single GPU takes about 35 minutes on a 4090
+(95 minutes on a 2080 Ti) and the exported ONNX file is ~50 MB.
+Fine-tuning *ByT5-small* on the same data took roughly 20 hours and
+ships ~300M parameters with the transformers stack attached. Greek
+lemmatization is pattern-rich enough that the small specialized model
+matches the large general one.
 
-- **Multi-period Greek in one tool.** No other lemmatizer covers Ancient,
-  Byzantine, and Modern Greek in a single system. Tools like Morpheus
-  handle only classical AG. Stanza handles AG or MG but not both.
-  Dilemma resolves Katharevousa, vernacular medieval, and regional MG
-  varieties (Cypriot, Cretan) alongside Homer and Herodotus.
-- **12.5M-form lookup table.** The largest compiled for Greek, built by
-  applying Wiktionary's Lua inflection modules to LSJ and Sophocles
-  headwords, then merging with five gold-standard treebanks and two
-  corpus-derived pair sets. This is a data engineering contribution, not
-  an algorithmic one.
-- **Dialect normalization.** Systematic Ionic, Doric, Aeolic, and Koine
-  orthographic mapping to Attic equivalents. No other Greek lemmatizer
-  handles dialectal variation this way.
-- **Elision with consonant de-assimilation and frequency ranking.**
-  Recovers prepositions like κατά from assimilated forms like καθ' by
-  reversing the aspiration rule, then ranks candidates by corpus frequency.
-- **Character-level transformer for Greek lemmatization.** The SIGMORPHON
-  encoder-decoder architecture is well established for morphological
-  inflection in other languages, but applying it to Greek lemmatization
-  (rather than inflection) appears to be new.
+See [Transformer model](#transformer-model) for the full architecture.
 
-### What's established
+### Convention remapping
 
-- The character-level encoder-decoder is the standard SIGMORPHON
-  architecture for morphological inflection/reinflection tasks across
-  many languages.
-- The SQLite lookup with monotonic/stripped fallback keys is a
-  straightforward hash table approach.
-- Edit-distance spelling correction uses a BK-tree, a well-known data
-  structure for metric-space nearest-neighbor search.
-- Wiktionary as a data source for morphological data is widely used
-  (kaikki.org, Lexonomy, etc.).
-- Treebank integration (Perseus, PROIEL, Gorman) follows standard
-  practice in computational linguistics.
+The same Greek word has different citation forms in different
+dictionaries. LSJ writes εἶπον as `λέγω`, Cunliffe writes γίνεται as
+`γίγνομαι`, Triantafyllidis writes σπήλαια as `σπήλαιο`, and Wiktionary
+disagrees with all three on a long tail of words. Tools like stanza,
+spaCy, and CLTK lock you into whatever convention their training
+treebank used.
 
-**Note on methodology:** Dilemma is a supervised system. The transformer
-trains on 3.5M explicit form-to-lemma pairs from Wiktionary inflection
-tables, and the lookup table (which handles 95%+ of words) is literally a
-dictionary of correct answers. This is not unsupervised learning (pattern
-discovery from raw text with no labels).
+Dilemma's `convention` parameter remaps the output to whichever standard
+you are targeting:
+
+```python
+Dilemma(convention="lsj")               # LSJ headwords
+Dilemma(convention="cunliffe")          # Cunliffe Homeric Lexicon
+Dilemma(convention="triantafyllidis")   # Triantafyllidis MG dictionary
+Dilemma()                               # default: Wiktionary headwords
+```
+
+The remapping table is built automatically from
+`data/lemma_equivalences.json` cross-referenced against each
+convention's headword list, with explicit per-convention overrides for
+edge cases. See [Conventions](#conventions).
+
+### Wiktionary Lua expansion of LSJ and Sophocles
+
+Wiktionary ships its own Lua inflection modules,
+[`Module:grc-decl`](https://en.wiktionary.org/wiki/Module:grc-decl) and
+[`Module:grc-conj`](https://en.wiktionary.org/wiki/Module:grc-conj),
+which generate full paradigms from a headword plus grammatical metadata.
+Wiktionary itself only renders those paradigms for headwords an editor
+has manually written up.
+
+Dilemma runs the same modules, via
+[wikitextprocessor](https://github.com/tatuylonen/wikitextprocessor),
+over the headword sets of LSJ (32K nouns, 22K verbs, 14K adjectives)
+and the Sophocles Byzantine/Patristic lexicon (13.5K nouns, 4.6K verbs).
+That produces about 5.2M extra inflected forms for classical and
+Byzantine vocabulary that is not enumerated anywhere on Wiktionary, and
+lifts the lookup table from 5.2M Wiktionary-only forms to 12.5M total,
+the largest compiled for Greek. It is the single biggest contributor
+to Dilemma's coverage of rare vocabulary.
+
+See [Lookup table](#lookup-table) and
+[LSJ/Sophocles expansion](#lsjsophocles-expansion) for the build
+pipeline.
+
+### How the pieces fit together
+
+The three pieces above sit on top of a layered pipeline:
+
+1. The 12.5M-form lookup table resolves most words instantly.
+2. A rule-based layer handles the things a lookup cannot enumerate:
+   augment and reduplication stripping, elision, crasis, enclitic
+   particle suffixes.
+3. A dialect normalizer maps Ionic, Doric, Aeolic, and Koine forms to
+   their Attic equivalents so the (Attic-heavy) lookup can match them.
+4. The transformer catches the remaining ~5% of words.
+
+Other things worth flagging:
+
+- No other lemmatizer covers Ancient, Byzantine, and Modern Greek in
+  one system. Morpheus is classical AG only; stanza is AG or MG but
+  not both. Dilemma resolves Katharevousa, vernacular medieval, and
+  regional MG varieties (Cypriot, Cretan) alongside Homer and
+  Herodotus.
+- Dialect normalization is systematic, not just a wordlist. No other
+  Greek lemmatizer handles Ionic/Doric/Aeolic/Koine variation this way.
+- Elision recovery does consonant de-assimilation. καθ' becomes κατά
+  by reversing the aspiration rule, with corpus frequency as the
+  tiebreaker between candidates.
+
+### Why these architecture choices
+
+Most of the design decisions in Dilemma are deliberate departures from
+how other Greek NLP tools are built. The individual techniques are
+standard in computational linguistics; what makes Dilemma the strongest
+Greek lemmatizer available is the combination, and the fact that each
+choice is the right one for Greek specifically.
+
+A character-level encoder-decoder, not a fine-tuned subword LM. The
+SIGMORPHON architecture is the right tool for morphologically rich
+inflectional languages, and Greek is the canonical example. Existing
+Greek tools either fine-tune a giant subword model (stanza, spaCy) or
+use rule-based morphological analyzers (Morpheus, CLTK) that struggle
+with anything outside their hand-coded paradigms. A 4M-parameter
+character-level model trained from scratch on Greek-specific data beats
+both: it learns the morphology directly, generalizes to unseen forms,
+and ships in 50 MB of ONNX rather than gigabytes of pretrained weights.
+
+A 12.5M-form SQLite lookup, not a model-only pipeline. Most Greek words
+are not interestingly ambiguous, and a hash-table lookup answers them
+in microseconds. Other tools route every word through their tagger;
+Dilemma reserves the model for the ~5% the lookup can't resolve, which
+is why it's both faster and more accurate. The SQLite layer with
+monotonic and accent-stripped fallback keys means polytonic, monotonic,
+and unaccented input all hit the same entries.
+
+Wiktionary's own Lua modules driving an external headword set, not
+hand-written paradigm tables. Existing morphological analyzers ship
+hand-coded paradigms (Morpheus' stemsrc, jtauber/greek-inflexion's
+templates) that take decades of expert effort to build and never quite
+finish. Dilemma instead invokes the very same `Module:grc-decl` and
+`Module:grc-conj` that Wiktionary editors use, but points them at the
+LSJ and Sophocles headword sets. That gets you 5.2M extra inflected
+forms with no per-paradigm hand-curation, which is what closes the
+classical and Byzantine vocabulary gap that every other tool has.
+
+A BK-tree for spelling correction. Edit-distance lookup over Greek's
+combinatorial accent-and-breathing space is hard to do quickly with a
+naive scan; a BK-tree gives metric-space nearest-neighbour search in
+log time and makes the whole spell-check feature feasible inside a
+mobile keyboard's memory budget.
+
+Convention remapping baked into the API. Every other Greek lemmatizer
+locks you into the citation conventions of its training treebank. By
+treating output convention as a runtime parameter backed by a
+machine-built equivalence table, Dilemma serves an LSJ workflow, a
+Cunliffe workflow, and a Triantafyllidis workflow from the same model
+weights. This is the difference between a tool that scores 65% on a
+benchmark because of citation mismatch and one that scores 95% on the
+underlying linguistic task.
+
+Fully supervised, end to end. Every training pair has a known-correct
+lemma (Wiktionary inflection tables, the Lua expansions, gold-standard
+treebanks), and the lookup table is literally a dictionary of correct
+answers. Nothing in Dilemma relies on unsupervised pattern discovery
+from raw text, which is why the failure modes are predictable and the
+fixes are reproducible (edit a Wiktionary entry, rerun the pipeline,
+the fix flows through).
 
 **SQLite backend:** The lookup table loads from a pre-built SQLite database
 (instant startup, ~0.3s) instead of parsing 600MB of JSON (~11s). Falls
@@ -116,7 +196,9 @@ table (which handles 95%+ of words) needs neither.
   - [Batch processing](#batch-processing)
   - [POS-aware disambiguation](#pos-aware-disambiguation)
   - [Spelling correction](#spelling-correction)
+  - [Paradigm generation](#paradigm-generation)
   - [Elision expansion](#elision-expansion)
+- [POS tagger and dependency parser](#pos-tagger-and-dependency-parser)
 - [Greek Coverage](#greek-coverage)
   - [Language codes](#language-codes)
   - [Modern Greek varieties](#modern-greek-varieties)
@@ -232,12 +314,16 @@ for forms like `σε`/`με` that are MG prepositions).
 
 ### Conventions
 
-Different dictionaries and treebanks use different citation forms for
-the same word. The `convention` parameter remaps Dilemma's output to
-match a specific standard. This matters for benchmarking: a tool that
-outputs `εἰμί` and a gold standard that expects `είμαι` will show
-as an error even though both are correct for their respective
+Different dictionaries cite the same Greek word differently. LSJ uses
+`λέγω` for the εἶπον family; Cunliffe uses `γίγνομαι` rather than
+`γίνομαι`; Triantafyllidis uses `είμαι` rather than `εἰμί`. A tool
+that outputs `εἰμί` against a gold standard expecting `είμαι` looks
+wrong, even though both answers are correct for their respective
 conventions.
+
+The `convention` parameter remaps Dilemma's output to whichever
+standard you're targeting. The same model can serve an LSJ workflow, a
+Cunliffe workflow, and a Triantafyllidis workflow without retraining.
 
 | Convention | Target | Example mappings |
 |------------|--------|-----------------|
@@ -420,7 +506,7 @@ The lookup table combines forms from multiple sources:
 | Source | Forms | Notes |
 |--------|------:|-------|
 | **Wiktionary** (EN + EL, all periods) | 5.2M | Baseline from kaikki.org dumps |
-| **LSJ** (Liddell-Scott-Jones) | 4.2M | 32K nouns, 22K verbs, 14K adjectives expanded via Wiktionary Lua modules |
+| **LSJ** (Liddell-Scott-Jones) | 4.2M | 32K nouns, 22K verbs (incl. 700+ with principal parts parsed from the entry head and ~800 athematic / irregular μι-verbs), 14K adjectives, all expanded via Wiktionary Lua modules |
 | **Sophocles Lexicon** (Byzantine/Patristic) | 1.0M | 13.5K nouns, 4.6K verbs, 1.5K adverbs from OCR'd TEI data |
 | **[GLAUx](https://github.com/alekkeersmaekers/glaux)** (Keersmaekers, 2021) | 557K | 17M-token corpus, 8th c. BC - 4th c. AD, 98.8% lemma accuracy |
 | **[Diorisis](https://figshare.com/articles/dataset/The_Diorisis_Ancient_Greek_Corpus/6187256)** (Vatri & McGillivray, 2018) | 76K new | 10M-token corpus, Homer - 5th c. AD, 91.4% lemma accuracy. Low-priority pairs (only added when no conflict with existing sources). Also provides frequency data (27M combined tokens with GLAUx). |
@@ -433,14 +519,46 @@ The lookup table combines forms from multiple sources:
 | **Perseus Digital Library** (L&S, Pape, Bailly, etc.) | 176K | Headword filter from multiple classical lexica |
 | Closed-class fixes | ~500 | Articles, pronouns, prepositions mapped to canonical lemmas |
 
-The LSJ and Sophocles expansions use Wiktionary's own
-[grc-decl](https://en.wiktionary.org/wiki/Module:grc-decl) and
-[grc-conj](https://en.wiktionary.org/wiki/Module:grc-conj) Lua modules
-(via [wikitextprocessor](https://github.com/tatuylonen/wikitextprocessor))
-to generate inflection paradigms from headwords with grammatical metadata.
-Cunliffe's Homeric Lexicon (~12K headwords) is not expanded this way
-because its headwords are a subset of LSJ and already covered by the
-LSJ expansion plus GLAUx Homeric corpus data (557K pairs).
+**Wiktionary Lua expansion.** Most of the non-Wiktionary forms above
+come from running Wiktionary's own
+[`grc-decl`](https://en.wiktionary.org/wiki/Module:grc-decl) and
+[`grc-conj`](https://en.wiktionary.org/wiki/Module:grc-conj) Lua modules
+over LSJ and Sophocles headwords, via
+[wikitextprocessor](https://github.com/tatuylonen/wikitextprocessor).
+These are the same modules Wiktionary editors invoke through
+`{{grc-decl}}` / `{{grc-conj}}` templates when they paste in a headword
+plus its grammatical metadata; the modules emit the full noun, verb, or
+adjective paradigm. Wiktionary itself only renders those paradigms for
+headwords an editor has manually written up. Running the modules over
+the 32K nouns + 22K verbs + 14K adjectives in LSJ and the 13.5K nouns +
+4.6K verbs in Sophocles produces millions of inflected forms for
+classical and Byzantine vocabulary that no editor has touched, which
+is what lifts the lookup table from 5.2M Wiktionary-only forms to 12.5M
+total and is why rare-vocabulary coverage on classical and Patristic
+texts is competitive with rule-based morphological analyzers. Cunliffe's
+Homeric Lexicon (~12K headwords) isn't expanded this way because its
+headwords are a subset of LSJ and already covered by the LSJ expansion
+plus the GLAUx Homeric corpus (557K pairs). See
+[LSJ/Sophocles expansion](#lsjsophocles-expansion) for the build step.
+
+The verb expansion is more than just the present system. For each
+verb headword, an LSJ-entry parser (`build/lsj_principal_parts.py`)
+walks the head paragraph and pulls out whatever principal parts LSJ
+has labelled (`fut.`, `aor.` 1 / 2, `pf.`, `pf. m./p.`, `aor. p.`,
+`impf.`, `plpf.`), feeding each into `Module:grc-conj` as a
+positional argument. About 712 LSJ-only verbs receive at least one
+parsed principal part this way, lifting them from present-tense-only
+expansion to full paradigm coverage and adding ~+55 unique forms per
+eligible verb on average. The classifier itself
+(`build/expand_lsj.py::_classify_verb`) routes athematic and
+irregular verbs explicitly: -ννυμι / -νυμι / -ημι / -ωμι / -αμι /
+-μι suffix dispatch for the regular cases, plus a hand-coded Attic
+core paradigm for εἰμί, εἶμι, οἶδα, χρή, φημί and their preverbed
+compounds (πάρειμι, σύνειμι, εἴσειμι, ...) joined via a backtracking
+preverb splitter. Across the 28,745-candidate LSJ verb set the full
+pipeline succeeds on 28,535 (99.27%); the residual failures are all
+OCR-corrupt or non-Attic dialect entries with no canonical Attic
+base.
 
 The lookup table is built from Wiktionary [kaikki dumps](https://kaikki.org/)
 (EN and EL editions for MG and AG, plus EL Medieval Greek), expanded with
@@ -553,14 +671,43 @@ d = Dilemma(normalize=True, period="byzantine")
 
 ### Transformer model
 
-The transformer is a small (~4M param) character-level encoder-decoder,
-the standard architecture from
-[SIGMORPHON](https://sigmorphon.github.io/) morphological inflection
-shared tasks. It learns character-level patterns and generalizes to forms
-not in Wiktionary. Training on MG + AG + Medieval data means the model
-sees AG augment patterns (`ἔλυσε` → `λύω`) alongside MG stem
-transformations (`σκότωσε` → `σκοτώνω`). For Katharevousa forms like
-`εσκότωσε`, it has both signals to draw from.
+The transformer is what catches everything the lookup and rule layers
+miss. It's a 4M-parameter character-level encoder-decoder, the standard
+[SIGMORPHON](https://sigmorphon.github.io/) inflection architecture
+pointed at lemmatization instead.
+
+It's supervised, not self-supervised. Training data is 3.5M explicit
+`(form, lemma)` pairs drawn from Wiktionary inflection tables, the LSJ
+and Sophocles Lua expansions, and gold-standard treebanks (Perseus,
+PROIEL, Gorman, DiGreC) plus annotated corpora (GLAUx, Diorisis, HNC).
+Every example has a known-correct answer.
+
+The vocabulary is character-level, not subword. The encoder reads one
+Greek character at a time over a ~381-token vocabulary covering
+monotonic, polytonic, and extended Unicode ranges. A 10-character Greek
+word is 10 encoder steps, not the ~20 UTF-8 byte steps ByT5 would need,
+so the model can use a small hidden size without losing morphological
+resolution.
+
+The model is trained from scratch, with no pretrained weights. End-to-end
+training on a single GPU takes ~35 minutes (RTX 4090) or ~95 minutes
+(RTX 2080 Ti). Fine-tuning *ByT5-small* on the same task takes ~20 hours
+and ships 300M parameters with the transformers stack attached.
+
+The encoder is shared with three auxiliary classification heads (POS,
+nominal morphology, verbal morphology), which improve representations
+via multi-task learning and produce morphological tags as a free
+byproduct. The same model handles AG, MG, and Medieval data, so AG
+augment patterns (`ἔλυσε` → `λύω`) and MG stem transformations
+(`σκότωσε` → `σκοτώνω`) inform each other; Katharevousa hybrids like
+`εσκότωσε` have both signals to draw from.
+
+At inference time the decoder runs beam search and the first candidate
+that matches a known headword (Wiktionary self-maps, LSJ9, Cunliffe,
+DGE, LGPN, Perseus Digital Library lexica) wins. If nothing matches,
+the input is returned unchanged rather than guessed at. Inference uses
+ONNX Runtime (~50 MB) by default, with PyTorch as an optional
+alternative; both backends produce identical outputs.
 
 ## API Reference
 
@@ -650,7 +797,7 @@ on demand rather than loading the full 12M-entry table into memory.
 
 ### POS-aware disambiguation
 
-When a POS tagger (e.g. [Morphy](https://github.com/ciscoriordan/morphy))
+When a POS tagger (e.g. Dilemma's [POS tagger module](#pos-tagger-and-dependency-parser))
 provides UPOS tags, `lemmatize_pos` uses POS to disambiguate between
 multiple candidates from the regular lookup:
 
@@ -726,6 +873,70 @@ d.is_headword("θεοί")              # False (inflected form, not a headword)
 d.is_headword("θεός", "cunliffe")  # check against Cunliffe headwords
 ```
 
+### Paradigm generation
+
+`dilemma.paradigm` resolves Ancient Greek inflection cells by source
+precedence (jtauber > Morpheus > dilemma_corpus > template), with a
+small template fallback for the simplest regular cases. Useful when
+a build pipeline needs full inflection paradigms for every lemma but
+the kaikki / corpus extracts only carry the cells that happened to
+be attested.
+
+```python
+from dilemma.paradigm import generate, generate_paradigm, ParadigmSlot
+
+slot = ParadigmSlot.verb_finite(
+    voice="active", tense="aorist", mood="indicative",
+    person="1", number="sg",
+)
+generate("γράφω", slot)
+# ParadigmForm(form="ἔγραψα", source="jtauber")
+
+generate_paradigm("γράφω", "verb")
+# {"active_aorist_indicative_1sg": ParadigmForm(...), ...}
+```
+
+Each form is wrapped in `ParadigmForm(form, source)` so callers can
+decide whether to trust a cell. Corpus and paradigm-table sources are
+safe to ship as-is; template fallbacks are best-effort. Inflection
+keys match the canonical shapes:
+
+| Shape | Example |
+|-------|---------|
+| Verb finite | `active_aorist_indicative_1sg` |
+| Verb infinitive | `active_aorist_infinitive` |
+| Verb participle | `active_aorist_participle_nom_m_sg` |
+| Noun | `genitive_pl` |
+| Adjective | `nominative_m_sg` |
+
+The orchestrator reads paradigm JSONs from `$DILEMMA_PARADIGM_DATA`
+(set this to a directory containing `jtauber_ag_paradigms.json`,
+`ag_verb_paradigms.json`, `ag_noun_paradigms.json`,
+`dilemma_ag_verb_paradigms.json`, and/or
+`dilemma_ag_noun_paradigms.json`). Missing files yield empty per-source
+dicts; the orchestrator falls through to whichever sources are
+available and finally to the template fallback.
+
+Templates handle thematic -ω verbs (present-system active only),
+vowel-stem 1st / 2nd-declension nouns, and three-termination -ος /
+-η / -ον adjectives. Anything that needs accent re-placement or stem
+allomorphy (contract -άω / -έω / -όω, athematic μι-verbs, suppletive
+verbs, 3rd-decl consonant stems) returns None so callers can leave
+the cell empty rather than ship a bogus form. Pass `allow_template=False`
+to skip the template path entirely and only return cells with explicit
+source attribution.
+
+A CLI entry point fills missing inflection cells across a build's
+canonical hash, mapping `{filepath: entry}`:
+
+```sh
+python -m dilemma paradigm fill --in pending.json --out filled.json [--with-templates]
+```
+
+Each filled cell is recorded in a sidecar `inflections_source.<dialect>.<key>`
+field on the entry so downstream consumers can render generator-filled
+cells distinctly from corpus-attested ones.
+
 ### Elision expansion
 
 Ancient Greek texts frequently elide final vowels before a following
@@ -760,6 +971,40 @@ pattern, and proper nouns are deprioritized.
 Polytonic input automatically restricts expansion to the AG lookup
 table, avoiding false matches from MG monotonic forms.
 
+## POS tagger and dependency parser
+
+Dilemma also ships a diachronic Greek POS tagger and dependency parser.
+They live under `dilemma.tagger` and install via the `[tagger]` extra
+(the dependency that pulls in `torch` and `transformers`):
+
+```bash
+pip install "dilemma[tagger]"
+python -m dilemma download              # also fetches the tagger weights
+```
+
+```python
+from dilemma import Tagger
+
+tagger = Tagger(lang="grc", device="cpu")    # Ancient Greek (device auto-detected)
+results = tagger.tag(["μῆνιν ἄειδε θεὰ Πηληϊάδεω Ἀχιλῆος"])
+for tok in results[0]:
+    print(tok)
+# {'form': 'μηνιν', 'upos': 'NOUN', 'lemma': 'μῆνις', 'feats': {...},
+#  'head': 2, 'deprel': 'obj', 'raw_form': 'μῆνιν'}
+```
+
+Supports `lang="el"` (Modern Greek), `lang="grc"` (Ancient), and
+`lang="med"` (Medieval/Byzantine). When `lemmatize=True` (the default),
+the tagger preloads the lemmatizer module internally and returns a
+`lemma` field on every token.
+
+The tagger is ~25x faster than `gr-nlp-toolkit` on real-world Greek text
+after `gr-nlp-toolkit`'s [PR #29](https://github.com/nlpaueb/gr-nlp-toolkit/pull/29)
+(which Dilemma's author contributed; pre-PR the gap was ~215x). On the
+full Iliad (24 books, 146K tokens) it tags + parses in 19.5 s. Trained
+weights, treebank sources, and the `lang="med"` Medieval/Byzantine model
+are documented in `dilemma/tagger/__init__.py`.
+
 ## Greek Coverage
 
 ### Language codes
@@ -787,10 +1032,10 @@ label still appears in `LemmaCandidate.lang` for forms from the
 medieval Wiktionary dump, but these are merged into the `el` lookup
 at build time.
 
-Note: [Morphy](https://github.com/ciscoriordan/morphy) (POS tagging +
-dependency parsing) uses `lang="grc"` for Byzantine text. Byzantine
-literary syntax (polytonic, full case system, optative mood) is closer
-to Ancient Greek, so the AG-trained POS tagger handles it well.
+Note: Dilemma's [POS tagger and dependency parser](#pos-tagger-and-dependency-parser)
+use `lang="grc"` for Byzantine text. Byzantine literary syntax
+(polytonic, full case system, optative mood) is closer to Ancient
+Greek, so the AG-trained tagger handles it well.
 
 ### Modern Greek varieties
 
@@ -965,6 +1210,99 @@ python build/expand_sophocles.py --expand-verbs  # expand Sophocles verbs
 This requires LSJ9 data from [lsj9](https://github.com/ciscoriordan/lsj9)
 (included in `data/lsjgr_bridges.json` and `data/lsj9_frequency.json`) and
 the Sophocles TEI data (included in `data/sophocles/`).
+
+`--expand-verbs` does three things:
+
+1. Classifies the headword via `_classify_verb` (suffix dispatch for
+   thematic and athematic types, explicit table for εἰμί / εἶμι /
+   οἶδα / χρή / φημί and their preverbed compounds) and runs
+   `Module:grc-conj` on the present-system paradigm.
+2. Parses the LSJ entry head paragraph with
+   `build/lsj_principal_parts.py` to extract whatever principal
+   parts LSJ has labelled (`fut.`, `aor.`, `pf.`, `pf. m./p.`,
+   `aor. p.`, `impf.`, `plpf.`).
+3. Re-invokes `Module:grc-conj` for each extracted tense, merging the
+   results into the verb's paradigm. Verbs without parsable principal
+   parts fall back to present-only behaviour, so the path is strictly
+   additive.
+
+About 712 LSJ-only verbs receive at least one parsed principal part
+through path 2; full-pipeline success on the 28,745 LSJ-only verb
+candidates is 99.27%.
+
+A separate post-processing pass in `build/build_grc_verb_paradigms.py`
+takes the same parsed principal parts and procedurally synthesises the
+missing finite-mood cells (subjunctive / optative / imperative / aorist
+infinitive) for thematic -ω verbs via `build/synth_verb_moods.py`, plus
+the full case×gender×number declension of every participle slot via
+`build/synth_verb_participles.py`, plus the past-indicative 1sg cells
+(active / middle imperfect; active / middle / passive aorist) for any
+verb where kaikki dropped the tense tag and the unaugmented Homeric
+variants got correctly filtered out into the epic dialect slice. Stem-
+templating only fills cells that aren't already attested by Wiktionary
+or GLAUx; real corpus cells are never overwritten.
+
+Coverage: on the 27K-verb output the synthesis adds ~278K finite-mood
+cells, ~775K participle cells, ~15K aor-2 cells, ~430K contract cells
+(active + middle present participle), and ~36K past-indicative 1sg
+cells. Comparing against jtauber/greek-inflexion's hand-curated
+paradigms on the 3.6K shared lemmas, dilemma's per-mood coverage is
+currently:
+
+| mood        | dilemma / jtauber | notes                             |
+|-------------|-------------------|-----------------------------------|
+| indicative  | 0.83              | mostly corpus / Wiktionary cells  |
+| subjunctive | 1.17              | full thematic + contract synth    |
+| optative    | 0.95              | full thematic + contract synth    |
+| imperative  | 1.03              | full thematic + contract synth    |
+| infinitive  | 1.49              | over-broad sigmatic synthesis     |
+| participle  | 0.95              | thematic + aor-2 + ε/α-contract   |
+| overall     | 0.97              | well past the 95% full-flip mark  |
+
+Synthesis covers thematic -ω verbs (regular and aor-2 / strong-aorist),
+α-/ε-/ο-contract verbs (present system), and the mixed-α aor-2 class
+(πίπτω → ἔπεσα, λέγω → εἶπα, εὑρίσκω → εὗρα) that uses α-style endings
+on the active and middle indicative but regular ο-thematic endings
+elsewhere. The participle ending tables encode jtauber's macron / breve
+quantity-mark conventions on feminine forms (-ουσᾰ / -ουσᾰν / -ούσᾱς
+present-active, -σᾱσα / -σᾱ́σᾱς aorist-active, -μενᾱς middle-passive,
+-υίᾱς perfect-active) so synthesised cells match jtauber verbatim.
+
+Known limitations: athematic μι-verbs are handled in the upstream LSJ
+expansion (path 2) rather than the synth module; perfect contract
+participles aren't synthesised because they'd need separate perfect-
+stem extraction; ο-contract middle participles are skipped because
+jtauber's pattern is too inconsistent cell-by-cell; and a small set of
+verbs with idiosyncratic accent (e.g. ὁρᾷς) are deferred to corpus.
+
+#### Non-Attic form filtering
+
+GLAUx provides AGDT 9-position morph tags but no dialect axis: a
+Homeric unaugmented imperfect / aorist gets the same active-imperfect
+or aorist tag as its Attic counterpart, and a sandhi crasis form like
+κἄβλεψας gets the same active-aorist-2sg tag as a regular ἔβλεψας
+would. The build pass recovers dialect / sandhi status from the
+surface form itself before populating the canonical Attic slice:
+
+- Crasis forms (consonant-initial words with a breathing mark on a
+  non-initial vowel: κἄβλεψας, τοὔνομα, χἠμεῖς) are dropped entirely
+  as textual artifacts. ~650 forms are removed across the 27K-verb
+  output.
+- Homeric iterative imperfects (-εσκον / -ασκον / -οσκον infix forms
+  on verbs whose lemma doesn't natively end in -σκω) are routed to
+  the ``epic`` dialect slice. ~370 forms.
+- Athematic root-aorist passives (ἐλύμην / ἔλυντο / λύτο series, with
+  middle-voice personal endings on a slot tagged passive aorist) go
+  to ``epic``. ~130 forms.
+- Unaugmented past-indicatives (aorist / imperfect / pluperfect cells
+  whose form lacks the augment that Attic mandates) go to ``epic``.
+  ~27K forms.
+
+Detection is conservative: lemmas starting with ε- whose forms also
+start with ε- are skipped to avoid clobbering compound-prefix verbs
+where the augment is internal (ἐκμολεῖν → ἐξέμολεν), and lemmas with
+long-vowel initials (η-, ω-) are skipped because their temporal
+augment is morphologically invisible.
 
 ### Export to ONNX
 
@@ -1572,4 +1910,4 @@ vocabulary (~160 tokens), so the same word is ~10 steps. Combined with
 
 ## License
 
-[MIT](https://opensource.org/license/mit). Copyright Francisco Riordan.
+[MIT](https://opensource.org/license/mit). © Francisco Riordan.
